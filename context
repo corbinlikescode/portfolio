@@ -1,0 +1,12 @@
+pc-health-wellness-monitor/
+├── README.md
+├── LICENSE
+├── .gitignore
+├── scripts/
+│   └── Monitor-PCHealth.ps1
+├── docs/
+│   ├── setup.md
+│   └── methodology.md
+└── screenshots/
+    ├── example-run.png
+    └── example-json.png
