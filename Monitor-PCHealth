@@ -1,0 +1,299 @@
+
+---
+
+## 3) The Script: `scripts/Monitor-PCHealth.ps1` (FULL WORKING VERSION)
+
+> This is built for **Windows** (because GPU performance counters and common hardware telemetry libraries are Windows-friendly).  
+> Temperature/clock readings require **LibreHardwareMonitorLib.dll** (optional but recommended).
+
+Create this file at: `scripts/Monitor-PCHealth.ps1`
+
+```powershell
+<#
+.SYNOPSIS
+  PC Health & Wellness Monitor (Snapshot or Continuous)
+
+.DESCRIPTION
+  Collects:
+    - Uptime (time alive)
+    - CPU utilization
+    - GPU utilization (if GPU Engine counters exist)
+    - CPU/GPU temperatures + clocks (if LibreHardwareMonitorLib.dll is provided)
+    - Bottleneck heuristic (CPU-likely / GPU-likely / Balanced/Unknown)
+
+.PARAMETER IntervalSec
+  Interval in seconds for continuous monitoring.
+
+.PARAMETER Continuous
+  Runs in a loop until Ctrl+C.
+
+.PARAMETER OutJson
+  Optional path to write JSON output (snapshot or latest loop iteration).
+
+.PARAMETER OutCsv
+  Optional path to append CSV log rows (good for continuous mode).
+
+.EXAMPLE
+  pwsh .\scripts\Monitor-PCHealth.ps1
+
+.EXAMPLE
+  pwsh .\scripts\Monitor-PCHealth.ps1 -Continuous -IntervalSec 5 -OutCsv .\pc-health.csv
+#>
+
+[CmdletBinding()]
+param(
+  [int]$IntervalSec = 5,
+  [switch]$Continuous,
+  [string]$OutJson,
+  [string]$OutCsv
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+
+function Get-Uptime {
+  $os = Get-CimInstance -ClassName Win32_OperatingSystem
+  $lastBoot = $os.LastBootUpTime
+  $uptime = (Get-Date) - $lastBoot
+  [pscustomobject]@{
+    LastBootUpTime = $lastBoot
+    Uptime         = $uptime
+    UptimePretty   = "{0:%d}d {0:%h}h {0:%m}m {0:%s}s" -f $uptime
+  }
+}
+
+function Get-CpuUtilization {
+  try {
+    $v = (Get-Counter "\Processor(_Total)\% Processor Time").CounterSamples.CookedValue
+    [math]::Round($v, 1)
+  } catch {
+    $null
+  }
+}
+
+function Get-GpuUtilization {
+  # Uses Windows "GPU Engine" performance counters (available on many Win10/11 systems).
+  # We try to average "3D" engine utilization values if present.
+  try {
+    $paths = (Get-Counter -ListSet "GPU Engine").Paths
+    $gpu3dPaths = $paths | Where-Object { $_ -match "Utilization Percentage" -and $_ -match "engtype_3D" }
+    if (-not $gpu3dPaths -or $gpu3dPaths.Count -eq 0) {
+      return $null
+    }
+    $samples = (Get-Counter $gpu3dPaths).CounterSamples | Select-Object -ExpandProperty CookedValue
+    if (-not $samples -or $samples.Count -eq 0) {
+      return $null
+    }
+    $avg = ($samples | Measure-Object -Average).Average
+    [math]::Round($avg, 1)
+  } catch {
+    $null
+  }
+}
+
+function Try-Load-LHM {
+  # Expect LibreHardwareMonitorLib.dll at .\scripts\libs\
+  $dllPath = Join-Path -Path $PSScriptRoot -ChildPath "libs\LibreHardwareMonitorLib.dll"
+  if (-not (Test-Path $dllPath)) {
+    return $false
+  }
+
+  try {
+    Add-Type -Path $dllPath -ErrorAction Stop | Out-Null
+    return $true
+  } catch {
+    return $false
+  }
+}
+
+function Get-LHMSensors {
+  # Returns temps/clocks if LibreHardwareMonitor is loaded and hardware supports it.
+  if (-not ("LibreHardwareMonitor.Hardware.Computer" -as [type])) {
+    return $null
+  }
+
+  $computer = New-Object LibreHardwareMonitor.Hardware.Computer
+  $computer.IsCpuEnabled = $true
+  $computer.IsGpuEnabled = $true
+  $computer.Open()
+
+  $cpuTemps = @()
+  $gpuTemps = @()
+  $cpuClocks = @()
+  $gpuClocks = @()
+
+  foreach ($hw in $computer.Hardware) {
+    $hw.Update()
+    foreach ($sensor in $hw.Sensors) {
+      if (-not $sensor -or -not $sensor.Value) { continue }
+
+      $sensorName = $sensor.Name
+      $sensorType = $sensor.SensorType.ToString()
+      $hwType     = $hw.HardwareType.ToString()
+
+      # Temperatures
+      if ($sensorType -eq "Temperature") {
+        if ($hwType -match "Cpu") { $cpuTemps += [pscustomobject]@{ Name=$sensorName; ValueC=[double]$sensor.Value } }
+        if ($hwType -match "Gpu") { $gpuTemps += [pscustomobject]@{ Name=$sensorName; ValueC=[double]$sensor.Value } }
+      }
+
+      # Clocks (MHz)
+      if ($sensorType -eq "Clock") {
+        if ($hwType -match "Cpu") { $cpuClocks += [pscustomobject]@{ Name=$sensorName; ValueMHz=[double]$sensor.Value } }
+        if ($hwType -match "Gpu") { $gpuClocks += [pscustomobject]@{ Name=$sensorName; ValueMHz=[double]$sensor.Value } }
+      }
+    }
+  }
+
+  $computer.Close()
+
+  function Select-BestTemp($arr) {
+    if (-not $arr -or $arr.Count -eq 0) { return $null }
+    # Prefer Package, else max temp
+    $pkg = $arr | Where-Object { $_.Name -match "Package" } | Select-Object -First 1
+    if ($pkg) { return [math]::Round($pkg.ValueC, 1) }
+    $max = ($arr | Measure-Object -Property ValueC -Maximum).Maximum
+    [math]::Round($max, 1)
+  }
+
+  function Select-MaxClockGHz($arr) {
+    if (-not $arr -or $arr.Count -eq 0) { return $null }
+    $maxMHz = ($arr | Measure-Object -Property ValueMHz -Maximum).Maximum
+    $ghz = $maxMHz / 1000.0
+    [math]::Round($ghz, 2)
+  }
+
+  [pscustomobject]@{
+    CpuTempC        = Select-BestTemp $cpuTemps
+    GpuTempC        = Select-BestTemp $gpuTemps
+    CpuClockMaxGHz  = Select-MaxClockGHz $cpuClocks
+    GpuClockMaxGHz  = Select-MaxClockGHz $gpuClocks
+    CpuTempSensors  = $cpuTemps
+    GpuTempSensors  = $gpuTemps
+    CpuClockSensors = $cpuClocks
+    GpuClockSensors = $gpuClocks
+  }
+}
+
+function Get-BottleneckGuess {
+  param(
+    [double]$CpuUtil,
+    [double]$GpuUtil
+  )
+
+  if ($null -eq $CpuUtil -and $null -eq $GpuUtil) { return "Unknown" }
+  if ($null -eq $GpuUtil) { return "Unknown (GPU counters unavailable)" }
+
+  if ($CpuUtil -ge 85 -and $GpuUtil -le 70) { return "CPU-likely" }
+  if ($GpuUtil -ge 90 -and $CpuUtil -le 70) { return "GPU-likely" }
+  return "Balanced/Unknown"
+}
+
+function Write-JsonIfNeeded($obj, $path) {
+  if ([string]::IsNullOrWhiteSpace($path)) { return }
+  $obj | ConvertTo-Json -Depth 6 | Out-File -FilePath $path -Encoding utf8
+}
+
+function Append-CsvIfNeeded($obj, $path) {
+  if ([string]::IsNullOrWhiteSpace($path)) { return }
+
+  $flat = [pscustomobject]@{
+    Timestamp        = $obj.Timestamp
+    UptimePretty     = $obj.Uptime.UptimePretty
+    CpuUtilPercent   = $obj.Utilization.CpuPercent
+    GpuUtilPercent   = $obj.Utilization.Gpu3DPercent
+    CpuTempC         = $obj.Telemetry.CpuTempC
+    GpuTempC         = $obj.Telemetry.GpuTempC
+    CpuClockMaxGHz   = $obj.Telemetry.CpuClockMaxGHz
+    GpuClockMaxGHz   = $obj.Telemetry.GpuClockMaxGHz
+    BottleneckGuess  = $obj.BottleneckGuess
+  }
+
+  $exists = Test-Path $path
+  if (-not $exists) {
+    $flat | Export-Csv -Path $path -NoTypeInformation
+  } else {
+    $flat | Export-Csv -Path $path -NoTypeInformation -Append
+  }
+}
+
+# Load LibreHardwareMonitor if present
+$lhmLoaded = Try-Load-LHM
+
+function Get-Snapshot {
+  $uptime = Get-Uptime
+  $cpuUtil = Get-CpuUtilization
+  $gpuUtil = Get-GpuUtilization
+
+  $telemetry = if ($lhmLoaded) { Get-LHMSensors } else { $null }
+
+  if (-not $telemetry) {
+    $telemetry = [pscustomobject]@{
+      CpuTempC        = $null
+      GpuTempC        = $null
+      CpuClockMaxGHz  = $null
+      GpuClockMaxGHz  = $null
+      CpuTempSensors  = @()
+      GpuTempSensors  = @()
+      CpuClockSensors = @()
+      GpuClockSensors = @()
+    }
+  }
+
+  $bottleneck = Get-BottleneckGuess -CpuUtil $cpuUtil -GpuUtil $gpuUtil
+
+  [pscustomobject]@{
+    Timestamp = (Get-Date).ToString("s")
+    Uptime = $uptime
+    Utilization = [pscustomobject]@{
+      CpuPercent   = $cpuUtil
+      Gpu3DPercent = $gpuUtil
+    }
+    Telemetry = $telemetry
+    BottleneckGuess = $bottleneck
+    Notes = @(
+      if (-not $lhmLoaded) { "LibreHardwareMonitorLib.dll not found; temps/clocks may be unavailable." }
+      if ($null -eq $gpuUtil) { "GPU Engine counters not available; GPU utilization may be unavailable." }
+    ) | Where-Object { $_ }
+  }
+}
+
+function Print-Snapshot($snap) {
+  $rows = @(
+    [pscustomobject]@{ Metric="Uptime"; Value=$snap.Uptime.UptimePretty }
+    [pscustomobject]@{ Metric="CPU Util (%)"; Value=$snap.Utilization.CpuPercent }
+    [pscustomobject]@{ Metric="GPU 3D Util (%)"; Value=$snap.Utilization.Gpu3DPercent }
+    [pscustomobject]@{ Metric="CPU Temp (C)"; Value=$snap.Telemetry.CpuTempC }
+    [pscustomobject]@{ Metric="GPU Temp (C)"; Value=$snap.Telemetry.GpuTempC }
+    [pscustomobject]@{ Metric="CPU Max Clock (GHz)"; Value=$snap.Telemetry.CpuClockMaxGHz }
+    [pscustomobject]@{ Metric="GPU Max Clock (GHz)"; Value=$snap.Telemetry.GpuClockMaxGHz }
+    [pscustomobject]@{ Metric="Bottleneck Guess"; Value=$snap.BottleneckGuess }
+  )
+
+  Write-Host ""
+  Write-Host "PC Health & Wellness Snapshot - $($snap.Timestamp)"
+  Write-Host "----------------------------------------------"
+  $rows | Format-Table -AutoSize
+
+  if ($snap.Notes.Count -gt 0) {
+    Write-Host ""
+    Write-Host "Notes:"
+    $snap.Notes | ForEach-Object { Write-Host " - $_" }
+  }
+}
+
+# Run
+if ($Continuous) {
+  while ($true) {
+    $snap = Get-Snapshot
+    Print-Snapshot $snap
+    Write-JsonIfNeeded $snap $OutJson
+    Append-CsvIfNeeded $snap $OutCsv
+    Start-Sleep -Seconds $IntervalSec
+  }
+} else {
+  $snap = Get-Snapshot
+  Print-Snapshot $snap
+  Write-JsonIfNeeded $snap $OutJson
+  Append-CsvIfNeeded $snap $OutCsv
+}
